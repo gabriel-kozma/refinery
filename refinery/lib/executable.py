@@ -11,18 +11,18 @@ The provided interface is the same for all executables. It powers the following 
 from __future__ import annotations
 
 import sys
+import re
 import itertools
 
 from typing import TYPE_CHECKING, NamedTuple
-from os import devnull as DEVNULL
 from abc import ABC, abstractmethod
 from enum import Enum
 from functools import lru_cache
 from uuid import uuid4
 
-from macholib.MachO import load_command, MachO, MachOHeader
+from ktool import load_macho_file, load_image, MachOFile, Section as MachOSection
 from pefile import PE as PEFile, SectionStructure, MACHINE_TYPE, DIRECTORY_ENTRY
-from elftools.elf.elffile import ELFFile
+from elftools.elf.elffile import ELFFile, SymbolTableSection
 
 from refinery.lib.structures import MemoryFile
 from refinery.lib.types import INF, ByteStr
@@ -39,22 +39,6 @@ class ParsingFailure(ValueError):
     """
     def __init__(self, kind):
         super().__init__(F'unable to parse input as {kind} file')
-
-
-_MACHO_ARCHS = {
-    1        : 'VAX',
-    6        : 'MC680x0',
-    7        : 'X86',
-    16777223 : 'X86_64',
-    10       : 'MC98000',
-    11       : 'HPPA',
-    12       : 'ARM',
-    13       : 'MC88000',
-    14       : 'SPARC',
-    15       : 'I860',
-    18       : 'POWERPC',
-    16777234 : 'POWERPC64',
-}
 
 
 def align(alignment: int, value: int, down=False) -> int:
@@ -102,12 +86,9 @@ def exeroute(
         else:
             return handler_elf(parsed, *args, **kwargs)
     if set(data[:4]) <= {0xFE, 0xED, 0xFA, 0xCE, 0xCF}:
-        class InMemoryMachO(MachO):
-            def __init__(self): super().__init__(DEVNULL)
-            def load(self, _): return super().load(MemoryFile(data))
         try:
-            parsed = InMemoryMachO()
-            assert parsed.headers
+            parsed = load_macho_file(
+                fp=MemoryFile(memoryview(data)), use_mmaped_io=False)
         except Exception as E:
             raise ParsingFailure('MachO') from E
         else:
@@ -318,7 +299,7 @@ class Executable(ABC):
     """
 
     _data: ByteStr
-    _head: Union[PEFile, ELFFile, MachO]
+    _head: Union[PEFile, ELFFile, MachOFile]
     _base: Optional[int]
     _type: ET
 
@@ -341,7 +322,7 @@ class Executable(ABC):
             base,
         )
 
-    def __init__(self, head: Union[PEFile, ELFFile, MachO], data: ByteStr, base: Optional[int] = None):
+    def __init__(self, head: Union[PEFile, ELFFile, MachOFile], data: ByteStr, base: Optional[int] = None):
         self._data = data
         self._head = head
         self._base = base
@@ -829,7 +810,7 @@ class ExecutableMachO(Executable):
     A MachO-executable.
     """
 
-    _head: MachO
+    _head: MachOFile
     _type = ET.MachO
 
     def symbols(self) -> Generator[Symbol, None, None]:
@@ -837,33 +818,32 @@ class ExecutableMachO(Executable):
 
     @lru_cache(maxsize=1)
     def image_defined_base(self) -> int:
-        return min(seg.vmaddr for seg, _ in self._macho_segments() if seg.vmaddr > 0)
+        return min(s.vm_address for s in self._macho_segments() if s.vm_address >= 0)
+
+    @lru_cache(maxsize=1)
+    def _primary_image(self):
+        return load_image(fp=self._head.slices[0])
 
     def _macho_segments(self):
-        headers: List[MachOHeader] = self._head.headers
-        for header in headers:
-            for cmd, segment, sections in header.commands:
-                cmd: load_command
-                if not cmd.get_cmd_name().startswith('LC_SEGMENT'):
-                    continue
-                if segment.filesize <= 0:
-                    continue
-                yield segment, sections
+        for segment in self._primary_image().segments.values():
+            if segment.file_size <= 0:
+                continue
+            yield segment
 
     def _segments(self, populate_sections=False) -> Generator[Segment, None, None]:
-        for segment, sections in self._macho_segments():
-            v_lower = segment.vmaddr
+        for segment in self._macho_segments():
+            p_lower = segment.file_address
+            p_upper = p_lower + segment.file_size
+            v_lower = segment.vm_address
             v_lower = self._rebase_img_to_usr(v_lower)
-            p_lower = segment.fileoff
-            v_upper = v_lower + segment.vmsize
-            p_upper = p_lower + segment.filesize
-            segment_name = self.ascii(segment.segname)
+            v_upper = v_lower + segment.size
+            segment_name = self.ascii(segment.name)
             if not populate_sections:
                 sections = None
             else:
                 sections = [
                     self._convert_section(section, segment_name)
-                    for section in sections
+                    for section in segment.sections.values()
                 ]
             yield Segment(
                 Range(p_lower, p_upper),
@@ -877,36 +857,31 @@ class ExecutableMachO(Executable):
             yield segment.as_section()
             yield from segment.sections
 
-    def _convert_section(self, section, segment: str) -> Section:
-        name = self.ascii(section.sectname)
-        p_lower = section.offset
-        v_lower = section.addr
+    def _convert_section(self, section: MachOSection, segment: str) -> Section:
+        name = self.ascii(section.name)
+        p_lower = section.file_address
+        v_lower = section.vm_address
         v_lower = self._rebase_img_to_usr(v_lower)
         p_upper = p_lower + section.size
-        v_upper = v_lower + align(section.align, section.size)
+        v_upper = v_lower + align(section.ptr_size, section.size)
         return Section(F'{segment}/{name}', Range(p_lower, p_upper), Range(v_lower, v_upper), False)
 
     def arch(self) -> Arch:
-        cputype = self._head.headers[0].header.cputype
-        try:
-            arch = _MACHO_ARCHS[cputype]
-        except KeyError:
-            arch = F'UNKNOWN(0x{cputype:X})'
+        i0 = self._primary_image()
+        ct = i0.slice.type.name
         try:
             return {
-                'X86'       : Arch.X32,
-                'X86_64'    : Arch.X64,
                 'ARM'       : Arch.ARM32,
-                'SPARC'     : Arch.SPARC32,
+                'ARM64'     : Arch.ARM64,
+                'ARM6432'   : Arch.ARM64,
                 'POWERPC'   : Arch.PPC32,
                 'POWERPC64' : Arch.PPC64,
-            }[arch]
+                'SPARC'     : Arch.SPARC32,
+                'X86'       : Arch.X32,
+                'X86_64'    : Arch.X64,
+            }[ct]
         except KeyError:
-            raise LookupError(F'Unsupported architecture: {arch}')
+            raise LookupError(F'Unsupported architecture: {ct}')
 
     def byte_order(self) -> BO:
-        headers: List[MachOHeader] = self._head.headers
-        return {
-            '<': BO.LE,
-            '>': BO.BE,
-        }[headers[0].endian]
+        return BO(self._primary_image().slice.byte_order)

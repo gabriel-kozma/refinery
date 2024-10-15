@@ -2,7 +2,7 @@
 requires = [
     "colorama",
     "defusedxml",
-    "macholib",
+    "k2l",
     "msgpack>=1.0.0",
     "pefile",
     "pycryptodomex",
